@@ -7,7 +7,10 @@
 		ticketSubmitted: false,
 		drawingDataUrl: null,
 		pastGenerated: [],
-		seedFromUpload: null
+		seedFromUpload: null,
+		rngRun: null, // { runDir, keyPath, numbers }
+		pastRun: null, // { runDir, keyPath, numbers }
+		randomnessKeyPath: null
 	};
 
 	function setActiveNav(route) {
@@ -389,6 +392,10 @@
 							<div class="control-group">
 								<label>Сгенерированная комбинация</label>
 								<div id="rngResult" class="numbers"></div>
+								<div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+									<button class="btn" id="rngZipBtn" disabled>Скачать архив</button>
+									<button class="btn" id="rngRandomnessBtn" disabled>Проверка на случайность</button>
+								</div>
 							</div>
 						</div>
 					</div>
@@ -519,7 +526,7 @@
 			}
 		});
 
-		app.querySelector('#generateFromDrawing').addEventListener('click', () => {
+		app.querySelector('#generateFromDrawing').addEventListener('click', async () => {
 			const min = parseInt(minTextInput.value) || 0;
 			const max = parseInt(maxTextInput.value) || 100;
 			const count = parseInt(countTextInput.value) || 6;
@@ -527,6 +534,76 @@
 			if (min >= max) { alert('Минимальное значение должно быть меньше максимального'); return; }
 			if (count > (max - min + 1)) { alert('Количество чисел не может быть больше диапазона'); return; }
 
+			// Show loading state
+			const generateBtn = app.querySelector('#generateFromDrawing');
+			const originalText = generateBtn.textContent;
+			generateBtn.textContent = 'Генерация...';
+			generateBtn.disabled = true;
+
+			try {
+				// 1) Save canvas to server to get photos folder
+				const canvasDataUrl = canvas.toDataURL('image/jpeg', 0.92);
+				const storeResp = await fetch('http://localhost:8000/store-canvas', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ canvas_data: canvasDataUrl })
+				});
+				if (!storeResp.ok) throw new Error('store-canvas failed');
+				const storeData = await storeResp.json();
+
+				// 2) Generate numbers using photos_folder
+				const genResp = await fetch('http://localhost:8000/generate', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						photos_folder: storeData.photos_folder,
+						low: min,
+						high: max,
+						count: count
+					})
+				});
+				if (!genResp.ok) throw new Error('generate failed');
+				const genData = await genResp.json();
+
+				// Save run info for randomness check and zip
+				state.rngRun = { runDir: genData.run_dir, keyPath: genData.key, numbers: genData.numbers || [] };
+				state.randomnessKeyPath = genData.key;
+
+				const resultEl = app.querySelector('#rngResult');
+				resultEl.innerHTML = '';
+				if (count > 50) {
+					// Too many — show only archive button
+					resultEl.innerHTML = '<span class="note">Сгенерировано ' + count + ' чисел. Скачайте архив для просмотра.</span>';
+				} else {
+					(genData.numbers || []).forEach(n => {
+						const b = document.createElement('span');
+						b.className = 'badge accent';
+						b.textContent = String(n);
+						resultEl.appendChild(b);
+					});
+				}
+
+				// Enable buttons
+				const zipBtn = app.querySelector('#rngZipBtn');
+				zipBtn.disabled = false;
+				zipBtn.onclick = () => downloadArchive(genData.run_dir);
+				const rndBtn = app.querySelector('#rngRandomnessBtn');
+				rndBtn.disabled = false;
+				rndBtn.onclick = () => runNistAndShow(genData.key, 'rng');
+
+			} catch (error) {
+				console.error('Error generating numbers:', error);
+				// Fallback to client-side generation
+				generateClientSide(min, max, count);
+			} finally {
+				// Restore button state
+				generateBtn.textContent = originalText;
+				generateBtn.disabled = false;
+			}
+		});
+
+		// Fallback client-side generation
+		function generateClientSide(min, max, count) {
 			// Extract entropy from canvas
 			const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 			const pixels = imageData.data;
@@ -552,18 +629,48 @@
 				}
 			}
 			
-			result.sort((a, b) => a - b);
-			
-			// Display result
 			const resultEl = app.querySelector('#rngResult');
 			resultEl.innerHTML = '';
-			result.forEach(n => {
-				const b = document.createElement('span');
-				b.className = 'badge accent';
-				b.textContent = String(n);
-				resultEl.appendChild(b);
-			});
-		});
+			if (count > 50) {
+				resultEl.innerHTML = '<span class="note">Сгенерировано ' + count + ' чисел. Скачайте архив для просмотра.</span>';
+			} else {
+				result.forEach(n => {
+					const b = document.createElement('span');
+					b.className = 'badge accent';
+					b.textContent = String(n);
+					resultEl.appendChild(b);
+				});
+			}
+		}
+
+		async function downloadArchive(runDir) {
+			try {
+				const resp = await fetch('http://localhost:8000/archive-run', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ run_dir: runDir })
+				});
+				if (!resp.ok) throw new Error('archive-run failed');
+				const blob = await resp.blob();
+				const url = URL.createObjectURL(blob);
+				const a = document.createElement('a');
+				a.href = url; a.download = 'run.zip';
+				document.body.appendChild(a); a.click(); a.remove();
+				URL.revokeObjectURL(url);
+			} catch (e) { console.error(e); }
+		}
+
+		async function runNistAndShow(keyPath, source) {
+			try {
+				const resp = await fetch('http://localhost:8000/nist/generate-from-key', {
+					method: 'POST', headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ key_path: keyPath, count: 1000000, low: 0, high: 1 })
+				});
+				if (!resp.ok) throw new Error('nist generate-from-key failed');
+				const data = await resp.json();
+				alert('NIST: ' + (data.passed_of_5 || 0) + ' / 5 тестов пройдено');
+			} catch (e) { console.error(e); }
+		}
 
 		// Helper function for seeded random
 		function mulberry32(a) {
