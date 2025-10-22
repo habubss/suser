@@ -1,0 +1,1 @@
+{ watch":["src"],"ext":"ts,json","exec":"ts-node src/index.ts}
